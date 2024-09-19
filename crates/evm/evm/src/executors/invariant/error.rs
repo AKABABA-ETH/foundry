@@ -11,8 +11,6 @@ use proptest::test_runner::TestError;
 pub struct InvariantFailures {
     /// Total number of reverts.
     pub reverts: usize,
-    /// How many different invariants have been broken.
-    pub broken_invariants_count: usize,
     /// The latest revert reason of a run.
     pub revert_reason: Option<String>,
     /// Maps a broken invariant to its specific error.
@@ -42,9 +40,9 @@ impl InvariantFuzzError {
             Self::BrokenInvariant(case_data) | Self::Revert(case_data) => {
                 (!case_data.revert_reason.is_empty()).then(|| case_data.revert_reason.clone())
             }
-            Self::MaxAssumeRejects(allowed) => Some(format!(
-                "The `vm.assume` cheatcode rejected too many inputs ({allowed} allowed)"
-            )),
+            Self::MaxAssumeRejects(allowed) => {
+                Some(format!("`vm.assume` rejected too many inputs ({allowed} allowed)"))
+            }
         }
     }
 }

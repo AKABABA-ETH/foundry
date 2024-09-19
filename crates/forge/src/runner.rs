@@ -20,23 +20,23 @@ use foundry_evm::{
     constants::CALLER,
     decode::RevertDecoder,
     executors::{
-        fuzz::{CaseOutcome, CounterExampleOutcome, FuzzOutcome, FuzzedExecutor},
+        fuzz::FuzzedExecutor,
         invariant::{
             check_sequence, replay_error, replay_run, InvariantExecutor, InvariantFuzzError,
-            InvariantFuzzTestResult,
         },
-        CallResult, EvmError, ExecutionErr, Executor, RawCallResult,
+        CallResult, EvmError, ExecutionErr, Executor, ITest, RawCallResult,
     },
     fuzz::{
         fixture_name,
         invariant::{CallDetails, InvariantContract},
         CounterExample, FuzzFixtures,
     },
-    traces::{load_contracts, TraceKind},
+    traces::{load_contracts, TraceKind, TraceMode},
 };
 use proptest::test_runner::TestRunner;
 use rayon::prelude::*;
 use std::{
+    borrow::Cow,
     cmp::min,
     collections::{BTreeMap, HashMap},
     time::Instant,
@@ -271,6 +271,7 @@ impl<'a> ContractRunner<'a> {
                 ));
             }
         }
+
         // There are multiple setUp function, so we return a single test result for `setUp`
         if setup_fns.len() > 1 {
             return SuiteResult::new(
@@ -308,18 +309,19 @@ impl<'a> ContractRunner<'a> {
         });
 
         // Invariant testing requires tracing to figure out what contracts were created.
+        // We also want to disable `debug` for setup since we won't be using those traces.
         let has_invariants = self.contract.abi.functions().any(|func| func.is_invariant_test());
-        let tmp_tracing =
-            self.executor.inspector().tracer.is_none() && has_invariants && call_setup;
-        if tmp_tracing {
-            self.executor.set_tracing(true);
+
+        let prev_tracer = self.executor.inspector_mut().tracer.take();
+        if prev_tracer.is_some() || has_invariants {
+            self.executor.set_tracing(TraceMode::Call);
         }
+
         let setup_time = Instant::now();
         let setup = self.setup(call_setup);
         debug!("finished setting up in {:?}", setup_time.elapsed());
-        if tmp_tracing {
-            self.executor.set_tracing(false);
-        }
+
+        self.executor.inspector_mut().tracer = prev_tracer;
 
         if setup.reason.is_some() {
             // The setup failed, so we return a single test result for `setUp`
@@ -348,7 +350,7 @@ impl<'a> ContractRunner<'a> {
         );
 
         let identified_contracts = has_invariants
-            .then(|| load_contracts(setup.traces.iter().map(|(_, t)| t), &known_contracts));
+            .then(|| load_contracts(setup.traces.iter().map(|(_, t)| &t.arena), &known_contracts));
         let test_results = functions
             .par_iter()
             .map(|&func| {
@@ -412,21 +414,26 @@ impl<'a> ContractRunner<'a> {
 
     /// Runs a single unit test.
     ///
-    /// Calls the given functions and returns the `TestResult`.
+    /// Applies before test txes (if any), runs current test and returns the `TestResult`.
     ///
-    /// State modifications are not committed to the evm database but discarded after the call,
-    /// similar to `eth_call`.
+    /// Before test txes are applied in order and state modifications committed to the EVM database
+    /// (therefore the unit test call will be made on modified state).
+    /// State modifications of before test txes and unit test function call are discarded after
+    /// test ends, similar to `eth_call`.
     pub fn run_unit_test(
         &self,
         func: &Function,
         should_fail: bool,
         setup: TestSetup,
     ) -> TestResult {
-        let address = setup.address;
-        let test_result = TestResult::new(setup);
+        // Prepare unit test execution.
+        let (executor, test_result, address) = match self.prepare_test(func, setup) {
+            Ok(res) => res,
+            Err(res) => return res,
+        };
 
-        // Run unit test
-        let (mut raw_call_result, reason) = match self.executor.call(
+        // Run current unit test.
+        let (mut raw_call_result, reason) = match executor.call(
             self.sender,
             address,
             func,
@@ -436,12 +443,11 @@ impl<'a> ContractRunner<'a> {
         ) {
             Ok(res) => (res.raw, None),
             Err(EvmError::Execution(err)) => (err.raw, Some(err.reason)),
-            Err(EvmError::SkipError) => return test_result.single_skip(),
-            Err(err) => return test_result.single_fail(err),
+            Err(EvmError::Skip(reason)) => return test_result.single_skip(reason),
+            Err(err) => return test_result.single_fail(Some(err.to_string())),
         };
 
-        let success =
-            self.executor.is_raw_call_mut_success(address, &mut raw_call_result, should_fail);
+        let success = executor.is_raw_call_mut_success(address, &mut raw_call_result, should_fail);
         test_result.single_result(success, reason, raw_call_result)
     }
 
@@ -461,7 +467,7 @@ impl<'a> ContractRunner<'a> {
         let mut test_result = TestResult::new(setup);
 
         // First, run the test normally to see if it needs to be skipped.
-        if let Err(EvmError::SkipError) = self.executor.call(
+        if let Err(EvmError::Skip(reason)) = self.executor.call(
             self.sender,
             address,
             func,
@@ -469,7 +475,7 @@ impl<'a> ContractRunner<'a> {
             U256::ZERO,
             Some(self.revert_decoder),
         ) {
-            return test_result.invariant_skip()
+            return test_result.invariant_skip(reason);
         };
 
         let mut evm = InvariantExecutor::new(
@@ -537,18 +543,20 @@ impl<'a> ContractRunner<'a> {
 
         let progress =
             start_fuzz_progress(self.progress, self.name, &func.name, invariant_config.runs);
-        let InvariantFuzzTestResult { error, cases, reverts, last_run_inputs, gas_report_traces } =
+        let invariant_result =
             match evm.invariant_fuzz(invariant_contract.clone(), &fuzz_fixtures, progress.as_ref())
             {
                 Ok(x) => x,
                 Err(e) => return test_result.invariant_setup_fail(e),
             };
+        // Merge coverage collected during invariant run with test setup coverage.
+        test_result.merge_coverages(invariant_result.coverage);
 
         let mut counterexample = None;
-        let success = error.is_none();
-        let reason = error.as_ref().and_then(|err| err.revert_reason());
+        let success = invariant_result.error.is_none();
+        let reason = invariant_result.error.as_ref().and_then(|err| err.revert_reason());
 
-        match error {
+        match invariant_result.error {
             // If invariants were broken, replay the error to collect logs and traces
             Some(error) => match error {
                 InvariantFuzzError::BrokenInvariant(case_data) |
@@ -599,7 +607,7 @@ impl<'a> ContractRunner<'a> {
                     &mut test_result.logs,
                     &mut test_result.traces,
                     &mut test_result.coverage,
-                    &last_run_inputs,
+                    &invariant_result.last_run_inputs,
                 ) {
                     error!(%err, "Failed to replay last invariant run");
                 }
@@ -607,15 +615,24 @@ impl<'a> ContractRunner<'a> {
         }
 
         test_result.invariant_result(
-            gas_report_traces,
+            invariant_result.gas_report_traces,
             success,
             reason,
             counterexample,
-            cases,
-            reverts,
+            invariant_result.cases,
+            invariant_result.reverts,
         )
     }
 
+    /// Runs a fuzzed test.
+    ///
+    /// Applies the before test txes (if any), fuzzes the current function and returns the
+    /// `TestResult`.
+    ///
+    /// Before test txes are applied in order and state modifications committed to the EVM database
+    /// (therefore the fuzz test will use the modified state).
+    /// State modifications of before test txes and fuzz test are discarded after test ends,
+    /// similar to `eth_call`.
     pub fn run_fuzz_test(
         &self,
         func: &Function,
@@ -624,18 +641,18 @@ impl<'a> ContractRunner<'a> {
         setup: TestSetup,
         fuzz_config: FuzzConfig,
     ) -> TestResult {
-        let address = setup.address;
-        let fuzz_fixtures = setup.fuzz_fixtures.clone();
-        let mut test_result = TestResult::new(setup);
-
-        // Run fuzz test
         let progress = start_fuzz_progress(self.progress, self.name, &func.name, fuzz_config.runs);
-        let fuzzed_executor = FuzzedExecutor::new(
-            self.executor.clone(),
-            runner.clone(),
-            self.sender,
-            fuzz_config.clone(),
-        );
+
+        // Prepare fuzz test execution.
+        let fuzz_fixtures = setup.fuzz_fixtures.clone();
+        let (executor, test_result, address) = match self.prepare_test(func, setup) {
+            Ok(res) => res,
+            Err(res) => return res,
+        };
+
+        // Run fuzz test.
+        let fuzzed_executor =
+            FuzzedExecutor::new(executor.into_owned(), runner, self.sender, fuzz_config);
         let result = fuzzed_executor.fuzz(
             func,
             &fuzz_fixtures,
@@ -644,48 +661,53 @@ impl<'a> ContractRunner<'a> {
             self.revert_decoder,
             progress.as_ref(),
         );
-
-        // Check the last test result and skip the test
-        // if it's marked as so.
-        if let Some("SKIPPED") = result.reason.as_deref() {
-            return test_result.single_skip()
-        }
-
-        if self.debug {
-            let mut debug_executor = self.executor.clone();
-            // turn the debug traces on
-            debug_executor.inspector_mut().enable_debugger(true);
-            debug_executor.inspector_mut().tracing(true);
-            let calldata = if let Some(counterexample) = result.counterexample.as_ref() {
-                match counterexample {
-                    CounterExample::Single(ce) => ce.calldata.clone(),
-                    _ => unimplemented!(),
-                }
-            } else {
-                result.first_case.calldata.clone()
-            };
-            // rerun the last relevant test with traces
-            let debug_result =
-                FuzzedExecutor::new(debug_executor, runner, self.sender, fuzz_config).single_fuzz(
-                    address,
-                    should_fail,
-                    calldata,
-                );
-
-            (test_result.debug, test_result.breakpoints) = match debug_result {
-                Ok(fuzz_outcome) => match fuzz_outcome {
-                    FuzzOutcome::Case(CaseOutcome { debug, breakpoints, .. }) => {
-                        (debug, breakpoints)
-                    }
-                    FuzzOutcome::CounterExample(CounterExampleOutcome {
-                        debug,
-                        breakpoints,
-                        ..
-                    }) => (debug, breakpoints),
-                },
-                Err(_) => (Default::default(), Default::default()),
-            };
-        }
         test_result.fuzz_result(result)
+    }
+
+    /// Prepares single unit test and fuzz test execution:
+    /// - set up the test result and executor
+    /// - check if before test txes are configured and apply them in order
+    ///
+    /// Before test txes are arrays of arbitrary calldata obtained by calling the `beforeTest`
+    /// function with test selector as a parameter.
+    ///
+    /// Unit tests within same contract (or even current test) are valid options for before test tx
+    /// configuration. Test execution stops if any of before test txes fails.
+    fn prepare_test(
+        &self,
+        func: &Function,
+        setup: TestSetup,
+    ) -> Result<(Cow<'_, Executor>, TestResult, Address), TestResult> {
+        let address = setup.address;
+        let mut executor = Cow::Borrowed(&self.executor);
+        let mut test_result = TestResult::new(setup);
+
+        // Apply before test configured functions (if any).
+        if self.contract.abi.functions().filter(|func| func.name.is_before_test_setup()).count() ==
+            1
+        {
+            for calldata in executor
+                .call_sol_default(
+                    address,
+                    &ITest::beforeTestSetupCall { testSelector: func.selector() },
+                )
+                .beforeTestCalldata
+            {
+                // Apply before test configured calldata.
+                match executor.to_mut().transact_raw(self.sender, address, calldata, U256::ZERO) {
+                    Ok(call_result) => {
+                        // Merge tx result traces in unit test result.
+                        test_result.merge_call_result(&call_result);
+
+                        // To continue unit test execution the call should not revert.
+                        if call_result.reverted {
+                            return Err(test_result.single_fail(None))
+                        }
+                    }
+                    Err(_) => return Err(test_result.single_fail(None)),
+                }
+            }
+        }
+        Ok((executor, test_result, address))
     }
 }
