@@ -69,8 +69,8 @@ pub struct TestArgs {
 
     /// Run a test in the debugger.
     ///
-    /// The argument passed to this flag is the name of the test function you want to run, and it
-    /// works the same as --match-test.
+    /// The argument passed to this flag is the **regex** of the test function signature you want
+    /// to run, and it works the same as --match-test.
     ///
     /// If more than one test matches your specified criteria, you must add additional filters
     /// until only one test is found (see --match-contract and --match-path).
@@ -86,10 +86,16 @@ pub struct TestArgs {
     debug: Option<Regex>,
 
     /// Generate a flamegraph for a single test. Implies `--decode-internal`.
+    ///
+    /// A flame graph is used to visualize which functions or operations within the smart contract
+    /// are consuming the most gas overall in a sorted manner.
     #[arg(long, conflicts_with = "flamechart")]
     flamegraph: bool,
 
     /// Generate a flamechart for a single test. Implies `--decode-internal`.
+    ///
+    /// A flame chart shows the gas usage over time, illustrating when each function is
+    /// called (execution order) and how much gas it consumes at each point in the timeline.
     #[arg(long, conflicts_with = "flamegraph")]
     flamechart: bool,
 

@@ -1865,7 +1865,7 @@ interface Vm {
 
     /// Checks if `key` exists in a JSON object
     /// `keyExists` is being deprecated in favor of `keyExistsJson`. It will be removed in future versions.
-    #[cheatcode(group = Json, status = Deprecated)]
+    #[cheatcode(group = Json, status = Deprecated(Some("replaced by `keyExistsJson`")))]
     function keyExists(string calldata json, string calldata key) external view returns (bool);
     /// Checks if `key` exists in a JSON object.
     #[cheatcode(group = Json)]
@@ -2134,6 +2134,19 @@ interface Vm {
         pure
         returns (bytes32[] memory);
 
+    /// Parses a string of TOML data and coerces it to type corresponding to `typeDescription`.
+    #[cheatcode(group = Toml)]
+    function parseTomlType(string calldata toml, string calldata typeDescription) external pure returns (bytes memory);
+    /// Parses a string of TOML data at `key` and coerces it to type corresponding to `typeDescription`.
+    #[cheatcode(group = Toml)]
+    function parseTomlType(string calldata toml, string calldata key, string calldata typeDescription) external pure returns (bytes memory);
+    /// Parses a string of TOML data at `key` and coerces it to type array corresponding to `typeDescription`.
+    #[cheatcode(group = Toml)]
+    function parseTomlTypeArray(string calldata toml, string calldata key, string calldata typeDescription)
+        external
+        pure
+        returns (bytes memory);
+
     /// Returns an array of all the keys in a TOML table.
     #[cheatcode(group = Toml)]
     function parseTomlKeys(string calldata toml, string calldata key) external pure returns (string[] memory keys);
@@ -2364,4 +2377,9 @@ impl PartialEq for ForgeContext {
             _ => false,
         }
     }
+}
+
+#[track_caller]
+const fn panic_unknown_safety() -> ! {
+    panic!("cannot determine safety from the group, add a `#[cheatcode(safety = ...)]` attribute")
 }
