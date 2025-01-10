@@ -23,7 +23,7 @@ async fn test_core() {
                 vec![(
                     "setUp()",
                     false,
-                    Some("setup failed: revert: setup failed predictably".to_string()),
+                    Some("revert: setup failed predictably".to_string()),
                     None,
                     None,
                 )],
@@ -70,13 +70,7 @@ async fn test_core() {
             ),
             (
                 "default/core/FailingTestAfterFailedSetup.t.sol:FailingTestAfterFailedSetupTest",
-                vec![(
-                    "setUp()",
-                    false,
-                    Some("setup failed: execution error".to_string()),
-                    None,
-                    None,
-                )],
+                vec![("setUp()", false, Some("execution error".to_string()), None, None)],
             ),
             (
                 "default/core/MultipleAfterInvariant.t.sol:MultipleAfterInvariant",
@@ -748,8 +742,8 @@ async fn test_trace() {
 
             assert_eq!(
                 deployment_traces.count(),
-                12,
-                "Test {test_name} did not have exactly 12 deployment trace."
+                13,
+                "Test {test_name} did not have exactly 13 deployment trace."
             );
             assert!(setup_traces.count() <= 1, "Test {test_name} had more than 1 setup trace.");
             assert_eq!(
@@ -764,9 +758,9 @@ async fn test_trace() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_assertions_revert_false() {
     let filter = Filter::new(".*", ".*NoAssertionsRevertTest", ".*");
-    let mut config = TEST_DATA_DEFAULT.config.clone();
-    config.assertions_revert = false;
-    let mut runner = TEST_DATA_DEFAULT.runner_with_config(config);
+    let mut runner = TEST_DATA_DEFAULT.runner_with(|config| {
+        config.assertions_revert = false;
+    });
     let results = runner.test_collect(&filter);
 
     assert_multiple(
@@ -790,9 +784,9 @@ async fn test_assertions_revert_false() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_legacy_assertions() {
     let filter = Filter::new(".*", ".*LegacyAssertions", ".*");
-    let mut config = TEST_DATA_DEFAULT.config.clone();
-    config.legacy_assertions = true;
-    let mut runner = TEST_DATA_DEFAULT.runner_with_config(config);
+    let mut runner = TEST_DATA_DEFAULT.runner_with(|config| {
+        config.legacy_assertions = true;
+    });
     let results = runner.test_collect(&filter);
 
     assert_multiple(
