@@ -1,30 +1,19 @@
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    fmt::{self, Display},
+};
 
 use crate::{Cheatcode, Cheatcodes, CheatsCtxt, Error, Result, Vm::*};
 use alloy_primitives::{
-    address, hex,
-    map::{hash_map::Entry, AddressHashMap, HashMap},
     Address, Bytes, LogData as RawLog, U256,
+    map::{AddressHashMap, HashMap, hash_map::Entry},
 };
-use alloy_sol_types::{SolError, SolValue};
-use foundry_common::ContractsByArtifact;
-use foundry_evm_core::decode::RevertDecoder;
-use revm::interpreter::{
-    return_ok, InstructionResult, Interpreter, InterpreterAction, InterpreterResult,
+use revm::{
+    context::JournalTr,
+    interpreter::{InstructionResult, Interpreter, InterpreterAction, InterpreterResult},
 };
-use spec::Vm;
 
-/// For some cheatcodes we may internally change the status of the call, i.e. in `expectRevert`.
-/// Solidity will see a successful call and attempt to decode the return data. Therefore, we need
-/// to populate the return with dummy bytes so the decode doesn't fail.
-///
-/// 8192 bytes was arbitrarily chosen because it is long enough for return values up to 256 words in
-/// size.
-static DUMMY_CALL_OUTPUT: Bytes = Bytes::from_static(&[0u8; 8192]);
-
-/// Same reasoning as [DUMMY_CALL_OUTPUT], but for creates.
-const DUMMY_CREATE_ADDRESS: Address = address!("0000000000000000000000000000000000000001");
-
+use super::revert_handlers::RevertParameters;
 /// Tracks the expected calls per address.
 ///
 /// For each address, we track the expected calls per call data. We track it in such manner
@@ -80,15 +69,17 @@ pub struct ExpectedRevert {
     /// The expected data returned by the revert, None being any.
     pub reason: Option<Vec<u8>>,
     /// The depth at which the revert is expected.
-    pub depth: u64,
+    pub depth: usize,
     /// The type of expected revert.
     pub kind: ExpectedRevertKind,
     /// If true then only the first 4 bytes of expected data returned by the revert are checked.
     pub partial_match: bool,
     /// Contract expected to revert next call.
     pub reverter: Option<Address>,
-    /// Actual reverter of the call.
+    /// Address that reverted the call.
     pub reverted_by: Option<Address>,
+    /// Max call depth reached during next call execution.
+    pub max_depth: usize,
     /// Number of times this revert is expected.
     pub count: u64,
     /// Actual number of times this revert has been seen.
@@ -98,7 +89,7 @@ pub struct ExpectedRevert {
 #[derive(Clone, Debug)]
 pub struct ExpectedEmit {
     /// The depth at which we expect this emit to have occurred
-    pub depth: u64,
+    pub depth: usize,
     /// The log we expect
     pub log: Option<RawLog>,
     /// The checks to perform:
@@ -117,6 +108,50 @@ pub struct ExpectedEmit {
     pub found: bool,
     /// Number of times the log is expected to be emitted
     pub count: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExpectedCreate {
+    /// The address that deployed the contract
+    pub deployer: Address,
+    /// Runtime bytecode of the contract
+    pub bytecode: Bytes,
+    /// Whether deployed with CREATE or CREATE2
+    pub create_scheme: CreateScheme,
+}
+
+#[derive(Clone, Debug)]
+pub enum CreateScheme {
+    Create,
+    Create2,
+}
+
+impl Display for CreateScheme {
+    fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::Create => write!(f, "CREATE"),
+            Self::Create2 => write!(f, "CREATE2"),
+        }
+    }
+}
+
+impl From<revm::context_interface::CreateScheme> for CreateScheme {
+    fn from(scheme: revm::context_interface::CreateScheme) -> Self {
+        match scheme {
+            revm::context_interface::CreateScheme::Create => Self::Create,
+            revm::context_interface::CreateScheme::Create2 { .. } => Self::Create2,
+            _ => unimplemented!("Unsupported create scheme"),
+        }
+    }
+}
+
+impl CreateScheme {
+    pub fn eq(&self, create_scheme: Self) -> bool {
+        matches!(
+            (self, create_scheme),
+            (Self::Create, Self::Create) | (Self::Create2, Self::Create2 { .. })
+        )
+    }
 }
 
 impl Cheatcode for expectCall_0Call {
@@ -353,6 +388,20 @@ impl Cheatcode for expectEmitAnonymous_3Call {
     }
 }
 
+impl Cheatcode for expectCreateCall {
+    fn apply(&self, state: &mut Cheatcodes) -> Result {
+        let Self { bytecode, deployer } = self;
+        expect_create(state, bytecode.clone(), *deployer, CreateScheme::Create)
+    }
+}
+
+impl Cheatcode for expectCreate2Call {
+    fn apply(&self, state: &mut Cheatcodes) -> Result {
+        let Self { bytecode, deployer } = self;
+        expect_create(state, bytecode.clone(), *deployer, CreateScheme::Create2)
+    }
+}
+
 impl Cheatcode for expectRevert_0Call {
     fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
         let Self {} = self;
@@ -586,14 +635,14 @@ impl Cheatcode for _expectCheatcodeRevert_2Call {
 impl Cheatcode for expectSafeMemoryCall {
     fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
         let Self { min, max } = *self;
-        expect_safe_memory(ccx.state, min, max, ccx.ecx.journaled_state.depth())
+        expect_safe_memory(ccx.state, min, max, ccx.ecx.journaled_state.depth().try_into()?)
     }
 }
 
 impl Cheatcode for stopExpectSafeMemoryCall {
     fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
         let Self {} = self;
-        ccx.state.allowed_mem_writes.remove(&ccx.ecx.journaled_state.depth());
+        ccx.state.allowed_mem_writes.remove(&ccx.ecx.journaled_state.depth().try_into()?);
         Ok(Default::default())
     }
 }
@@ -601,7 +650,21 @@ impl Cheatcode for stopExpectSafeMemoryCall {
 impl Cheatcode for expectSafeMemoryCallCall {
     fn apply_stateful(&self, ccx: &mut CheatsCtxt) -> Result {
         let Self { min, max } = *self;
-        expect_safe_memory(ccx.state, min, max, ccx.ecx.journaled_state.depth() + 1)
+        expect_safe_memory(ccx.state, min, max, (ccx.ecx.journaled_state.depth() + 1).try_into()?)
+    }
+}
+
+impl RevertParameters for ExpectedRevert {
+    fn reverter(&self) -> Option<Address> {
+        self.reverter
+    }
+
+    fn reason(&self) -> Option<&[u8]> {
+        self.reason.as_deref()
+    }
+
+    fn partial_match(&self) -> bool {
+        self.partial_match
     }
 }
 
@@ -621,7 +684,7 @@ impl Cheatcode for expectSafeMemoryCallCall {
 ///   `vm.expectCall(address(0xc4f3), abi.encodeWithSelector(0xd34db33f))` will expect the call to
 ///   address(0xc4f3) and selector `0xd34db33f` to be made at least once. If the amount of calls is
 ///   0, the test will fail. If the call is made more than once, the test will pass.
-#[allow(clippy::too_many_arguments)] // It is what it is
+#[expect(clippy::too_many_arguments)] // It is what it is
 fn expect_call(
     state: &mut Cheatcodes,
     target: &Address,
@@ -634,17 +697,17 @@ fn expect_call(
 ) -> Result {
     let expecteds = state.expected_calls.entry(*target).or_default();
 
-    if let Some(val) = value {
-        if *val > U256::ZERO {
-            // If the value of the transaction is non-zero, the EVM adds a call stipend of 2300 gas
-            // to ensure that the basic fallback function can be called.
-            let positive_value_cost_stipend = 2300;
-            if let Some(gas) = &mut gas {
-                *gas += positive_value_cost_stipend;
-            }
-            if let Some(min_gas) = &mut min_gas {
-                *min_gas += positive_value_cost_stipend;
-            }
+    if let Some(val) = value
+        && *val > U256::ZERO
+    {
+        // If the value of the transaction is non-zero, the EVM adds a call stipend of 2300 gas
+        // to ensure that the basic fallback function can be called.
+        let positive_value_cost_stipend = 2300;
+        if let Some(gas) = &mut gas {
+            *gas += positive_value_cost_stipend;
+        }
+        if let Some(min_gas) = &mut min_gas {
+            *min_gas += positive_value_cost_stipend;
         }
     }
 
@@ -691,7 +754,7 @@ fn expect_call(
 
 fn expect_emit(
     state: &mut Cheatcodes,
-    depth: u64,
+    depth: usize,
     checks: [bool; 5],
     address: Option<Address>,
     anonymous: bool,
@@ -727,7 +790,7 @@ pub(crate) fn handle_expect_emit(
     // This allows a contract to arbitrarily emit more events than expected (additive behavior),
     // as long as all the previous events were matched in the order they were expected to be.
     if state.expected_emits.iter().all(|(expected, _)| expected.found) {
-        return
+        return;
     }
 
     let should_fill_logs = state.expected_emits.iter().any(|(expected, _)| expected.log.is_none());
@@ -761,16 +824,16 @@ pub(crate) fn handle_expect_emit(
                 .expected_emits
                 .insert(index_to_fill_or_check, (event_to_fill_or_check, count_map));
         } else {
-            interpreter.instruction_result = InstructionResult::Revert;
-            interpreter.next_action = InterpreterAction::Return {
+            interpreter.control.instruction_result = InstructionResult::Revert;
+            interpreter.control.next_action = InterpreterAction::Return {
                 result: InterpreterResult {
                     output: Error::encode("use vm.expectEmitAnonymous to match anonymous events"),
-                    gas: interpreter.gas,
+                    gas: interpreter.control.gas,
                     result: InstructionResult::Revert,
                 },
             };
         }
-        return
+        return;
     };
 
     // Increment/set `count` for `log.address` and `log.data`
@@ -795,7 +858,7 @@ pub(crate) fn handle_expect_emit(
 
     event_to_fill_or_check.found = || -> bool {
         if !checks_topics_and_data(event_to_fill_or_check.checks, expected, log) {
-            return false
+            return false;
         }
 
         // Maybe match source address.
@@ -860,11 +923,11 @@ impl LogCountMap {
         if self.map.contains_key(log) {
             self.map.entry(log.clone()).and_modify(|c| *c += 1);
 
-            return true
+            return true;
         }
 
         if !self.satisfies_checks(log) {
-            return false
+            return false;
         }
 
         self.map.entry(log.clone()).and_modify(|c| *c += 1).or_insert(1);
@@ -879,7 +942,7 @@ impl LogCountMap {
 
     pub fn count(&self, log: &RawLog) -> u64 {
         if !self.satisfies_checks(log) {
-            return 0
+            return 0;
         }
 
         self.count_unchecked()
@@ -890,10 +953,22 @@ impl LogCountMap {
     }
 }
 
+fn expect_create(
+    state: &mut Cheatcodes,
+    bytecode: Bytes,
+    deployer: Address,
+    create_scheme: CreateScheme,
+) -> Result {
+    let expected_create = ExpectedCreate { bytecode, deployer, create_scheme };
+    state.expected_creates.push(expected_create);
+
+    Ok(Default::default())
+}
+
 fn expect_revert(
     state: &mut Cheatcodes,
     reason: Option<&[u8]>,
-    depth: u64,
+    depth: usize,
     cheatcode: bool,
     partial_match: bool,
     reverter: Option<Address>,
@@ -914,145 +989,16 @@ fn expect_revert(
         partial_match,
         reverter,
         reverted_by: None,
+        max_depth: depth,
         count,
         actual_count: 0,
     });
     Ok(Default::default())
 }
 
-pub(crate) fn handle_expect_revert(
-    is_cheatcode: bool,
-    is_create: bool,
-    expected_revert: &mut ExpectedRevert,
-    status: InstructionResult,
-    retdata: Bytes,
-    known_contracts: &Option<ContractsByArtifact>,
-) -> Result<(Option<Address>, Bytes)> {
-    let success_return = || {
-        if is_create {
-            (Some(DUMMY_CREATE_ADDRESS), Bytes::new())
-        } else {
-            (None, DUMMY_CALL_OUTPUT.clone())
-        }
-    };
-
-    let stringify = |data: &[u8]| {
-        if let Ok(s) = String::abi_decode(data, true) {
-            return s;
-        }
-        if data.is_ascii() {
-            return std::str::from_utf8(data).unwrap().to_owned();
-        }
-        hex::encode_prefixed(data)
-    };
-
-    if expected_revert.count == 0 {
-        if expected_revert.reverter.is_none() && expected_revert.reason.is_none() {
-            ensure!(
-                matches!(status, return_ok!()),
-                "call reverted when it was expected not to revert"
-            );
-            return Ok(success_return());
-        }
-
-        // Flags to track if the reason and reverter match.
-        let mut reason_match = expected_revert.reason.as_ref().map(|_| false);
-        let mut reverter_match = expected_revert.reverter.as_ref().map(|_| false);
-
-        // Reverter check
-        if let (Some(expected_reverter), Some(actual_reverter)) =
-            (expected_revert.reverter, expected_revert.reverted_by)
-        {
-            if expected_reverter == actual_reverter {
-                reverter_match = Some(true);
-            }
-        }
-
-        // Reason check
-        let expected_reason = expected_revert.reason.as_deref();
-        if let Some(expected_reason) = expected_reason {
-            let mut actual_revert: Vec<u8> = retdata.into();
-            actual_revert = decode_revert(actual_revert);
-
-            if actual_revert == expected_reason {
-                reason_match = Some(true);
-            }
-        };
-
-        match (reason_match, reverter_match) {
-            (Some(true), Some(true)) => Err(fmt_err!(
-                "expected 0 reverts with reason: {}, from address: {}, but got one",
-                &stringify(expected_reason.unwrap_or_default()),
-                expected_revert.reverter.unwrap()
-            )),
-            (Some(true), None) => Err(fmt_err!(
-                "expected 0 reverts with reason: {}, but got one",
-                &stringify(expected_reason.unwrap_or_default())
-            )),
-            (None, Some(true)) => Err(fmt_err!(
-                "expected 0 reverts from address: {}, but got one",
-                expected_revert.reverter.unwrap()
-            )),
-            _ => Ok(success_return()),
-        }
-    } else {
-        ensure!(!matches!(status, return_ok!()), "next call did not revert as expected");
-
-        // If expected reverter address is set then check it matches the actual reverter.
-        if let (Some(expected_reverter), Some(actual_reverter)) =
-            (expected_revert.reverter, expected_revert.reverted_by)
-        {
-            if expected_reverter != actual_reverter {
-                return Err(fmt_err!(
-                    "Reverter != expected reverter: {} != {}",
-                    actual_reverter,
-                    expected_reverter
-                ));
-            }
-        }
-
-        let expected_reason = expected_revert.reason.as_deref();
-        // If None, accept any revert.
-        let Some(expected_reason) = expected_reason else {
-            return Ok(success_return());
-        };
-
-        if !expected_reason.is_empty() && retdata.is_empty() {
-            bail!("call reverted as expected, but without data");
-        }
-
-        let mut actual_revert: Vec<u8> = retdata.into();
-
-        // Compare only the first 4 bytes if partial match.
-        if expected_revert.partial_match && actual_revert.get(..4) == expected_reason.get(..4) {
-            return Ok(success_return())
-        }
-
-        // Try decoding as known errors.
-        actual_revert = decode_revert(actual_revert);
-
-        if actual_revert == expected_reason ||
-            (is_cheatcode && memchr::memmem::find(&actual_revert, expected_reason).is_some())
-        {
-            Ok(success_return())
-        } else {
-            let (actual, expected) = if let Some(contracts) = known_contracts {
-                let decoder = RevertDecoder::new().with_abis(contracts.iter().map(|(_, c)| &c.abi));
-                (
-                    &decoder.decode(actual_revert.as_slice(), Some(status)),
-                    &decoder.decode(expected_reason, Some(status)),
-                )
-            } else {
-                (&stringify(&actual_revert), &stringify(expected_reason))
-            };
-            Err(fmt_err!("Error != expected error: {} != {}", actual, expected,))
-        }
-    }
-}
-
 fn checks_topics_and_data(checks: [bool; 5], expected: &RawLog, log: &RawLog) -> bool {
     if log.topics().len() != expected.topics().len() {
-        return false
+        return false;
     }
 
     // Check topics.
@@ -1063,12 +1009,12 @@ fn checks_topics_and_data(checks: [bool; 5], expected: &RawLog, log: &RawLog) ->
         .filter(|(i, _)| checks[*i])
         .all(|(i, topic)| topic == &expected.topics()[i])
     {
-        return false
+        return false;
     }
 
     // Check data
     if checks[4] && expected.data.as_ref() != log.data.as_ref() {
-        return false
+        return false;
     }
 
     true
@@ -1076,20 +1022,8 @@ fn checks_topics_and_data(checks: [bool; 5], expected: &RawLog, log: &RawLog) ->
 
 fn expect_safe_memory(state: &mut Cheatcodes, start: u64, end: u64, depth: u64) -> Result {
     ensure!(start < end, "memory range start ({start}) is greater than end ({end})");
-    #[allow(clippy::single_range_in_vec_init)] // Wanted behaviour
+    #[expect(clippy::single_range_in_vec_init)] // Wanted behaviour
     let offsets = state.allowed_mem_writes.entry(depth).or_insert_with(|| vec![0..0x60]);
     offsets.push(start..end);
     Ok(Default::default())
-}
-
-fn decode_revert(revert: Vec<u8>) -> Vec<u8> {
-    if matches!(
-        revert.get(..4).map(|s| s.try_into().unwrap()),
-        Some(Vm::CheatcodeError::SELECTOR | alloy_sol_types::Revert::SELECTOR)
-    ) {
-        if let Ok(decoded) = Vec::<u8>::abi_decode(&revert[4..], false) {
-            return decoded;
-        }
-    }
-    revert
 }

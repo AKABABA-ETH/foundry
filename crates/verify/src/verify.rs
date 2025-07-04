@@ -1,29 +1,27 @@
 //! The `forge verify-bytecode` command.
 
 use crate::{
-    etherscan::EtherscanVerificationProvider,
-    provider::{VerificationProvider, VerificationProviderType},
-    utils::is_host_only,
     RetryArgs,
+    etherscan::EtherscanVerificationProvider,
+    provider::{VerificationContext, VerificationProvider, VerificationProviderType},
+    utils::is_host_only,
 };
-use alloy_primitives::Address;
+use alloy_primitives::{Address, map::HashSet};
 use alloy_provider::Provider;
 use clap::{Parser, ValueHint};
 use eyre::Result;
+use foundry_block_explorers::EtherscanApiVersion;
 use foundry_cli::{
     opts::{EtherscanOpts, RpcOpts},
     utils::{self, LoadConfig},
 };
-use foundry_common::{compile::ProjectCompiler, ContractsByArtifact};
+use foundry_common::{ContractsByArtifact, compile::ProjectCompiler};
 use foundry_compilers::{artifacts::EvmVersion, compilers::solc::Solc, info::ContractInfo};
-use foundry_config::{figment, impl_figment_convert, impl_figment_convert_cast, Config, SolcReq};
+use foundry_config::{Config, SolcReq, figment, impl_figment_convert, impl_figment_convert_cast};
 use itertools::Itertools;
 use reqwest::Url;
-use revm_primitives::HashSet;
 use semver::BuildMetadata;
 use std::path::PathBuf;
-
-use crate::provider::VerificationContext;
 
 /// Verification provider arguments
 #[derive(Clone, Debug, Parser)]
@@ -39,6 +37,10 @@ pub struct VerifierArgs {
     /// The verifier URL, if using a custom provider.
     #[arg(long, help_heading = "Verifier options", env = "VERIFIER_URL")]
     pub verifier_url: Option<String>,
+
+    /// The verifier API version, if using a custom provider.
+    #[arg(long, help_heading = "Verifier options", env = "VERIFIER_API_VERSION")]
+    pub verifier_api_version: Option<EtherscanApiVersion>,
 }
 
 impl Default for VerifierArgs {
@@ -47,6 +49,7 @@ impl Default for VerifierArgs {
             verifier: VerificationProviderType::Sourcify,
             verifier_api_key: None,
             verifier_url: None,
+            verifier_api_version: None,
         }
     }
 }
@@ -180,6 +183,10 @@ impl figment::Provider for VerifyArgs {
             dict.insert("etherscan_api_key".into(), api_key.as_str().into());
         }
 
+        if let Some(api_version) = &self.verifier.verifier_api_version {
+            dict.insert("etherscan_api_version".into(), api_version.to_string().into());
+        }
+
         Ok(figment::value::Map::from([(Config::selected_profile(), dict)]))
     }
 }
@@ -187,7 +194,7 @@ impl figment::Provider for VerifyArgs {
 impl VerifyArgs {
     /// Run the verify command to submit the contract's source code for verification on etherscan
     pub async fn run(mut self) -> Result<()> {
-        let config = self.load_config_emit_warnings();
+        let config = self.load_config()?;
 
         if self.guess_constructor_args && config.get_rpc_url().is_none() {
             eyre::bail!(
@@ -216,23 +223,26 @@ impl VerifyArgs {
                 .create_verify_request(&self, &context)
                 .await?;
             sh_println!("{}", args.source)?;
-            return Ok(())
+            return Ok(());
         }
 
         let verifier_url = self.verifier.verifier_url.clone();
         sh_println!("Start verifying contract `{}` deployed on {chain}", self.address)?;
+        if let Some(version) = &self.evm_version {
+            sh_println!("EVM version: {version}")?;
+        }
         if let Some(version) = &self.compiler_version {
             sh_println!("Compiler version: {version}")?;
         }
         if let Some(optimizations) = &self.num_of_optimizations {
             sh_println!("Optimizations:    {optimizations}")?
         }
-        if let Some(args) = &self.constructor_args {
-            if !args.is_empty() {
-                sh_println!("Constructor args: {args}")?
-            }
+        if let Some(args) = &self.constructor_args
+            && !args.is_empty()
+        {
+            sh_println!("Constructor args: {args}")?
         }
-        self.verifier.verifier.client(&self.etherscan.key())?.verify(self, context).await.map_err(|err| {
+        self.verifier.verifier.client(self.etherscan.key().as_deref())?.verify(self, context).await.map_err(|err| {
             if let Some(verifier_url) = verifier_url {
                  match Url::parse(&verifier_url) {
                     Ok(url) => {
@@ -256,13 +266,13 @@ impl VerifyArgs {
 
     /// Returns the configured verification provider
     pub fn verification_provider(&self) -> Result<Box<dyn VerificationProvider>> {
-        self.verifier.verifier.client(&self.etherscan.key())
+        self.verifier.verifier.client(self.etherscan.key().as_deref())
     }
 
     /// Resolves [VerificationContext] object either from entered contract name or by trying to
     /// match bytecode located at given address.
     pub async fn resolve_context(&self) -> Result<VerificationContext> {
-        let mut config = self.load_config_emit_warnings();
+        let mut config = self.load_config()?;
         config.libraries.extend(self.libraries.clone());
 
         let project = config.project()?;
@@ -299,12 +309,16 @@ impl VerifyArgs {
                         "Ambiguous compiler versions found in cache: {}",
                         unique_versions.iter().join(", ")
                     );
-                    eyre::bail!("Compiler version has to be set in `foundry.toml`. If the project was not deployed with foundry, specify the version through `--compiler-version` flag.")
+                    eyre::bail!(
+                        "Compiler version has to be set in `foundry.toml`. If the project was not deployed with foundry, specify the version through `--compiler-version` flag."
+                    )
                 }
 
                 unique_versions.into_iter().next().unwrap().to_owned()
             } else {
-                eyre::bail!("If cache is disabled, compiler version must be either provided with `--compiler-version` option or set in foundry.toml")
+                eyre::bail!(
+                    "If cache is disabled, compiler version must be either provided with `--compiler-version` option or set in foundry.toml"
+                )
             };
 
             let settings = if let Some(profile) = &self.compilation_profile {
@@ -343,17 +357,20 @@ impl VerifyArgs {
                 if profiles.is_empty() {
                     eyre::bail!("No matching artifact found for {}", contract.name);
                 } else if profiles.len() > 1 {
-                    eyre::bail!("Ambiguous compilation profiles found in cache: {}, please specify the profile through `--compilation-profile` flag", profiles.iter().join(", "))
+                    eyre::bail!(
+                        "Ambiguous compilation profiles found in cache: {}, please specify the profile through `--compilation-profile` flag",
+                        profiles.iter().join(", ")
+                    )
                 }
 
                 let profile = profiles.into_iter().next().unwrap().to_owned();
-                let settings = cache.profiles.get(&profile).expect("must be present");
-
-                settings
+                cache.profiles.get(&profile).expect("must be present")
             } else if project.additional_settings.is_empty() {
                 &project.settings
             } else {
-                eyre::bail!("If cache is disabled, compilation profile must be provided with `--compiler-version` option or set in foundry.toml")
+                eyre::bail!(
+                    "If cache is disabled, compilation profile must be provided with `--compiler-version` option or set in foundry.toml"
+                )
             };
 
             VerificationContext::new(
@@ -429,7 +446,7 @@ impl VerifyCheckArgs {
             "Checking verification status on {}",
             self.etherscan.chain.unwrap_or_default()
         )?;
-        self.verifier.verifier.client(&self.etherscan.key())?.check(self).await
+        self.verifier.verifier.client(self.etherscan.key().as_deref())?.check(self).await
     }
 }
 
@@ -441,7 +458,16 @@ impl figment::Provider for VerifyCheckArgs {
     fn data(
         &self,
     ) -> Result<figment::value::Map<figment::Profile, figment::value::Dict>, figment::Error> {
-        self.etherscan.data()
+        let mut dict = self.etherscan.dict();
+        if let Some(api_key) = &self.etherscan.key {
+            dict.insert("etherscan_api_key".into(), api_key.as_str().into());
+        }
+
+        if let Some(api_version) = &self.etherscan.api_version {
+            dict.insert("etherscan_api_version".into(), api_version.to_string().into());
+        }
+
+        Ok(figment::value::Map::from([(Config::selected_profile(), dict)]))
     }
 }
 

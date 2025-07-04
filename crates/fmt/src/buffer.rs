@@ -88,7 +88,7 @@ impl<W> FormatBuffer<W> {
 
     /// Indent the buffer by delta
     pub fn indent(&mut self, delta: usize) {
-        self.indents.extend(std::iter::repeat(IndentGroup::default()).take(delta));
+        self.indents.extend(std::iter::repeat_n(IndentGroup::default(), delta));
     }
 
     /// Dedent the buffer by delta
@@ -181,7 +181,7 @@ impl<W: Write> FormatBuffer<W> {
                 .take(self.base_indent_len)
                 .take_while(|(_, _, ch)| ch.is_whitespace())
                 .last()
-                .map(|(state, idx, _)| (state, idx + 1))
+                .map(|(state, idx, ch)| (state, idx + ch.len_utf8()))
                 .unwrap_or((comment_state, 0));
             comment_state = new_comment_state;
             let trimmed_line = &line[line_start..];
@@ -193,7 +193,7 @@ impl<W: Write> FormatBuffer<W> {
             }
             if lines.peek().is_some() || s.ends_with('\n') {
                 if self.restrict_to_single_line {
-                    return Err(std::fmt::Error)
+                    return Err(std::fmt::Error);
                 }
                 self.w.write_char('\n')?;
                 self.handle_newline(comment_state);
@@ -206,7 +206,7 @@ impl<W: Write> FormatBuffer<W> {
 impl<W: Write> Write for FormatBuffer<W> {
     fn write_str(&mut self, mut s: &str) -> std::fmt::Result {
         if s.is_empty() {
-            return Ok(())
+            return Ok(());
         }
 
         let mut indent = " ".repeat(self.current_indent_len());
@@ -221,7 +221,7 @@ impl<W: Write> Write for FormatBuffer<W> {
                                 self.w.write_str(s)?;
                                 self.handle_newline(comment_state);
                             }
-                            break
+                            break;
                         }
 
                         // We can see the next non-empty line. Write up to the
@@ -250,7 +250,7 @@ impl<W: Write> Write for FormatBuffer<W> {
                 }
                 WriteState::WriteTokens(comment_state) => {
                     if s.is_empty() {
-                        break
+                        break;
                     }
 
                     // find the next newline or non-comment string separator (e.g. ' or ")
@@ -261,13 +261,13 @@ impl<W: Write> Write for FormatBuffer<W> {
                         len = idx;
                         if ch == '\n' {
                             if self.restrict_to_single_line {
-                                return Err(std::fmt::Error)
+                                return Err(std::fmt::Error);
                             }
                             new_state = WriteState::LineStart(state);
-                            break
+                            break;
                         } else if state == CommentState::None && (ch == '\'' || ch == '"') {
                             new_state = WriteState::WriteString(ch);
-                            break
+                            break;
                         } else {
                             new_state = WriteState::WriteTokens(state);
                         }
@@ -279,7 +279,7 @@ impl<W: Write> Write for FormatBuffer<W> {
                         self.current_line_len += s.len();
                         self.last_char = s.chars().next_back();
                         self.state = new_state;
-                        break
+                        break;
                     } else {
                         // A newline or string has been found. Write up to that character and
                         // continue on the tail
@@ -305,7 +305,7 @@ impl<W: Write> Write for FormatBuffer<W> {
                             self.w.write_str(s)?;
                             self.current_line_len += s.len();
                             self.last_char = s.chars().next_back();
-                            break
+                            break;
                         }
                         // String end found, write the string and continue to add tokens after
                         Some((_, _, len)) => {
@@ -431,7 +431,7 @@ mod tests {
             /* comment2 */ ",
         ];
 
-        for content in contents.iter() {
+        for content in &contents {
             let mut buf = FormatBuffer::new(String::new(), TAB_WIDTH);
             write!(buf, "{content}")?;
             assert_eq!(&buf.w, content);
